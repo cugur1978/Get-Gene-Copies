@@ -1,0 +1,160 @@
+import os
+import re
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from scipy.cluster.hierarchy import linkage
+
+def process_genomes_with_visualization(folder_path, output_excel, output_svg_1, output_svg_2):
+    def analyze_gene_paralogs(file_path):
+        try:
+            gene_counts = defaultdict(int)
+            gene_products = defaultdict(set)
+            inside_cds = False
+            current_product = ""
+            current_gene = None
+            multiline_product = False
+
+            with open(file_path, 'r') as file:
+                lines = file.readlines()
+                for line_num, line in enumerate(lines, start=1):
+                    if line.strip().startswith("CDS"):
+                        inside_cds = True
+                        current_product = ""
+                        current_gene = None
+                        multiline_product = False
+                        continue
+
+                    if inside_cds:
+                        if multiline_product:
+                            current_product += " " + line.strip()
+                            if '"' in line:
+                                multiline_product = False
+                            continue
+
+                        gene_match = re.search(r'/gene="([^"]+)"', line)
+                        if gene_match:
+                            current_gene = gene_match.group(1).strip()
+                            base_gene_name = re.sub(r'_\d+$', '', current_gene)
+                            gene_counts[base_gene_name] += 1
+                            if current_product.strip():
+                                gene_products[base_gene_name].add(current_product.strip())
+
+                        if "/product=" in line:
+                            product_match = re.search(r'/product="([^"]*)', line)
+                            if product_match:
+                                current_product = product_match.group(1).strip()
+                                if not '"' in line:
+                                    multiline_product = True
+                                elif current_gene:
+                                    base_gene_name = re.sub(r'_\d+$', '', current_gene)
+                                    gene_products[base_gene_name].add(current_product)
+
+                        if line.strip() == "":
+                            inside_cds = False
+
+            return {
+                "counts": {gene: count for gene, count in gene_counts.items() if count > 1},
+                "products": {gene: list(products) for gene, products in gene_products.items() if gene in gene_counts and gene_counts[gene] > 1}
+            }
+
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return {"counts": {}, "products": {}}
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return {"counts": {}, "products": {}}
+
+    all_genes = set()
+    genome_data = {}
+    product_data = {}
+
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".gbk"):
+            file_path = os.path.join(folder_path, filename)
+            result = analyze_gene_paralogs(file_path)
+            genome_data[filename] = result["counts"]
+            product_data.update(result["products"])
+            all_genes.update(result["counts"].keys())
+
+    all_genes = sorted(all_genes)
+    df_counts = pd.DataFrame(columns=["Gene"] + list(genome_data.keys()))
+    df_counts["Gene"] = all_genes
+
+    for genome, gene_counts in genome_data.items():
+        df_counts[genome] = df_counts["Gene"].apply(lambda gene: gene_counts.get(gene, 0))
+
+    df_products = pd.DataFrame({
+        "Gene": list(product_data.keys()),
+        "Products": ["; ".join(products) for products in product_data.values()]
+    })
+
+    with pd.ExcelWriter(output_excel) as writer:
+        df_counts.to_excel(writer, sheet_name="Paralog Gene Counts", index=False)
+        df_products.to_excel(writer, sheet_name="Gene Products", index=False)
+
+    print(f"Results saved to {output_excel}.")
+
+    # Visualization 1: Dendrogram and Heatmap
+    genome_columns = list(genome_data.keys())
+    paralog_matrix = df_counts[genome_columns].T.fillna(0)
+
+    linkage_matrix = linkage(paralog_matrix, method='ward')
+    sns.set_theme(context='notebook', style='whitegrid')
+
+    plt.figure(figsize=(16, 10))
+    sns.clustermap(
+        paralog_matrix,
+        row_linkage=linkage_matrix,
+        cmap='viridis_r',
+        figsize=(16, 10),
+        xticklabels=False,
+        yticklabels=genome_columns,
+        cbar_kws={'label': 'Paralog Gene Count'}
+    )
+    plt.title('Ward Method Dendrogram and Parallel Heatmap (Reversed Colors)')
+    plt.savefig(output_svg_1, format='svg')
+    print(f"Visualization saved to {output_svg_1}.")
+    plt.close()
+
+    # Visualization 2: Top Repeated Genes
+    mean_values = df_counts.iloc[:, 1:].mean(axis=1).sort_values(ascending=False)
+    std_values = df_counts.iloc[:, 1:].std(axis=1).sort_values(ascending=False)
+    top_50_genes_indices = mean_values.index[:50]
+
+    mean_values_50 = mean_values.iloc[:50]
+    std_values_50 = std_values[top_50_genes_indices]
+    top_50_highest_genes_names = df_counts.loc[top_50_genes_indices, "Gene"]
+
+    filtered_colors_50 = ['orange' if all(df_counts.iloc[idx, 1:] > 0) else 'red' for idx in top_50_genes_indices]
+
+    plt.figure(figsize=(16, 8))
+    bars = plt.bar(
+        top_50_highest_genes_names,
+        mean_values_50,
+        yerr=std_values_50,
+        capsize=5,
+        color=filtered_colors_50
+    )
+
+    corrected_legend_handles = [
+        plt.Line2D([0], [0], color='orange', lw=10, label='Present in all genomes'),
+        plt.Line2D([0], [0], color='red', lw=10, label='Absent in at least one genome')
+    ]
+    plt.legend(handles=corrected_legend_handles, loc='upper right')
+
+    plt.xticks(rotation=90, fontsize=8)
+    plt.xlabel('Genes')
+    plt.ylabel('Average Count')
+    plt.title('Top 50 Genes: Average Count with Two-Color Presence Indicator (Corrected Legend)')
+    plt.tight_layout()
+    plt.savefig(output_svg_2, format='svg')
+    print(f"Visualization saved to {output_svg_2}.")
+    plt.close()
+
+process_genomes_with_visualization(
+    folder_path="folder_path",
+    output_excel="folder_path\paralog_genes.xlsx",
+    output_svg_1="folder_path\dendrogram_heatmap.svg",
+    output_svg_2="folder_path\top_50_genes_bar_chart.svg") 
